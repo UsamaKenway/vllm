@@ -128,6 +128,39 @@ class GGUFModelLoader(BaseModelLoader):
             # Gemma3 models use "gemma3_text" in HuggingFace but
             # "gemma3" in GGUF architecture naming
             model_type = "gemma3"
+        if model_type in ("gemma4_text", "gemma4"):
+            model_type = "gemma4"
+            # Map scale tensors and MoE expert tensors manually.
+            # Gemma4 MoE uses combined expert tensors (gate_up_exps,
+            # down_exps) that map directly to vLLM's FusedMoE params.
+            # The .weight suffix enables the GGUF quant pipeline to
+            # convert to .qweight/.qweight_type automatically.
+            for idx in range(text_config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_inp.scale"] = (
+                    f"model.layers.{idx}.router.scale"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.scale"] = (
+                    f"model.layers.{idx}.router.per_expert_scale"
+                )
+                # Map combined expert tensors -> FusedMoE w13/w2 params
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_up_exps.weight"] = (
+                    f"model.layers.{idx}.moe.experts.w13_weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"model.layers.{idx}.moe.experts.w2_weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.layer_output_scale.weight"] = (
+                    f"model.layers.{idx}.layer_scalar"
+                )
+                # Suppress unmapped params for HF-only expert names
+                sideload_params.append(
+                    re.compile(
+                        f"model\\.layers\\.{idx}"
+                        r"\.(experts\.(gate_up_proj|down_proj)"
+                        r"|router\.(scale|per_expert_scale)"
+                        r"|layer_scalar)"
+                    )
+                )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
@@ -271,6 +304,11 @@ class GGUFModelLoader(BaseModelLoader):
             # gguf-py expects it.
             if hf_name.startswith("language_model."):
                 hf_name = hf_name[15:]  # Remove 'language_model.'
+            elif hf_name.startswith("model.language_model."):
+                # Some multimodal models (e.g. Gemma4) nest the text
+                # backbone under model.language_model.* in state_dict.
+                # Strip 'model.language_model.' to get 'model.layers.*'
+                hf_name = hf_name[21:]
 
             # Parse parameter name and suffix
             if hf_name.endswith((".weight", ".bias")):

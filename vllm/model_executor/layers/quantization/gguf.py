@@ -638,6 +638,18 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_qweight_type, extra_weight_attrs)
         layer.register_parameter("w2_qweight_type", w2_qweight_type)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        """Materialize GGUF MoE weights from their data_containers."""
+        for qw_name in ("w13_qweight", "w2_qweight"):
+            qw = getattr(layer, qw_name, None)
+            if qw is None or not hasattr(qw, "data_container"):
+                continue
+            if len(qw.data_container) == 1:
+                data = qw.data_container[0]
+                qw.materialize(data.shape)
+                qw.data.copy_(data)
+                qw.data_container.clear()
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:

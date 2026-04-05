@@ -1035,6 +1035,21 @@ class Gemma4Model(nn.Module):
                     if is_pp_missing_parameter(name, self):
                         continue
                     param = params_dict[name]
+                    # GGUF MoE weights (w13_qweight, w2_qweight,
+                    # w13_qweight_type, w2_qweight_type) arrive as
+                    # combined expert tensors from the GGUF quant
+                    # pipeline.  Load them directly rather than going
+                    # through FusedMoE.weight_loader which expects
+                    # per-expert arguments.
+                    if "moe.experts." in name:
+                        if getattr(param, "is_gguf_weight", False):
+                            param.data_container.append(loaded_weight)
+                            loaded_params.add(name)
+                            continue
+                        if getattr(param, "is_gguf_weight_type", False):
+                            param.weight_type = loaded_weight.item()
+                            loaded_params.add(name)
+                            continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
