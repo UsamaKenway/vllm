@@ -646,7 +646,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
                 continue
             if len(qw.data_container) == 1:
                 data = qw.data_container[0]
-                qw.materialize(data.shape)
+                qw.materialize(data.shape, dtype=data.dtype)
                 qw.data.copy_(data)
                 qw.data_container.clear()
 
