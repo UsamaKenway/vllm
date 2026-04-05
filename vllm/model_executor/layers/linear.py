@@ -1176,11 +1176,21 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
 
             if loaded_shard_id is not None:
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                # Use the expected per-TP shard size so that MQA/GQA
+                # KV heads are replicated instead of incorrectly sliced
+                # when num_kv_heads < tp_size.
+                shard_size = self._get_shard_size_mapping(loaded_shard_id)
+                loaded_dim = loaded_weight.size(output_dim)
+
+                if loaded_dim > shard_size:
+                    # Normal case: slice the weight for this TP rank
+                    start_idx = self.tp_rank * shard_size
+                    loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                # else: MQA/GQA replication — weight already equals
+                # the per-TP size, keep it in full on every rank.
+
                 param.shard_id.append(loaded_shard_id)
                 param.shard_id_map[loaded_shard_id] = len(param.data_container)
                 param.data_container.append(loaded_weight)
