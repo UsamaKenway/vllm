@@ -117,7 +117,53 @@ class Gemma4MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
+
+        # DEBUG: trace NaN source in MLP
+        if x.isnan().any():
+            import logging as _logging
+            _dbg = _logging.getLogger("gemma4_debug")
+            # Re-run step by step to find the NaN source
+            with torch.no_grad():
+                inp = self.input_debug  # captured below
+                gu, _ = self.gate_up_proj(inp)
+                _dbg.warning(
+                    "MLP NaN trace: input nan=%s min=%.4f max=%.4f, "
+                    "gate_up nan=%s min=%.4f max=%.4f shape=%s, "
+                    "gate_up_proj qweight shape=%s shard_id=%s",
+                    inp.isnan().any().item(),
+                    inp.float().min().item(), inp.float().max().item(),
+                    gu.isnan().any().item(),
+                    gu.float().min().item() if not gu.isnan().any() else float('nan'),
+                    gu.float().max().item() if not gu.isnan().any() else float('nan'),
+                    list(gu.shape),
+                    list(self.gate_up_proj.qweight.shape) if hasattr(self.gate_up_proj, 'qweight') else 'N/A',
+                    getattr(self.gate_up_proj.qweight, 'shard_id', 'N/A') if hasattr(self.gate_up_proj, 'qweight') else 'N/A',
+                )
+                act_out = self.act_fn(gu)
+                _dbg.warning(
+                    "MLP NaN trace: act nan=%s, down_proj qweight shape=%s",
+                    act_out.isnan().any().item(),
+                    list(self.down_proj.qweight.shape) if hasattr(self.down_proj, 'qweight') else 'N/A',
+                )
+                dp, _ = self.down_proj(act_out)
+                _dbg.warning(
+                    "MLP NaN trace: down_out nan=%s min=%.4f max=%.4f "
+                    "down_qtype=%s down_qweight[:4]=%s "
+                    "act_out min=%.4f max=%.4f shape=%s",
+                    dp.isnan().any().item(),
+                    dp.float().min().item() if not dp.isnan().any() else float('nan'),
+                    dp.float().max().item() if not dp.isnan().any() else float('nan'),
+                    getattr(self.down_proj.qweight_type, 'weight_type', 'N/A') if hasattr(self.down_proj, 'qweight_type') else 'N/A',
+                    self.down_proj.qweight.data.flatten()[:4].tolist() if hasattr(self.down_proj, 'qweight') else 'N/A',
+                    act_out.float().min().item() if not act_out.isnan().any() else float('nan'),
+                    act_out.float().max().item() if not act_out.isnan().any() else float('nan'),
+                    list(act_out.shape),
+                )
         return x
+
+    def __call__(self, x, *args, **kwargs):
+        self.input_debug = x.detach()
+        return super().__call__(x, *args, **kwargs)
 
 
 class Gemma4Router(nn.Module):
@@ -584,6 +630,12 @@ class Gemma4DecoderLayer(nn.Module):
         # Gemma4 residual pattern:
         # 1. input_norm(x) → attn → post_attn_norm → ADD residual
         # 2. pre_ff_norm → mlp → post_ff_norm → ADD residual
+        import logging as _logging
+        _dbg = _logging.getLogger("gemma4_debug")
+        if not hasattr(self, '_layer_debug_count'):
+            self._layer_debug_count = 0
+        _tracing = self._layer_debug_count < 2 and self.layer_idx in (7, 8)
+
         residual = hidden_states
 
         hidden_states = self.input_layernorm(residual)
@@ -593,6 +645,10 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             **kwargs,
         )
+        if _tracing:
+            _dbg.warning("L%d after attn: nan=%s min=%.4f max=%.4f",
+                self.layer_idx, hidden_states.isnan().any().item(),
+                hidden_states.float().min().item(), hidden_states.float().max().item())
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
@@ -601,6 +657,10 @@ class Gemma4DecoderLayer(nn.Module):
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if _tracing:
+            _dbg.warning("L%d after mlp: nan=%s min=%.4f max=%.4f",
+                self.layer_idx, hidden_states.isnan().any().item(),
+                hidden_states.float().min().item(), hidden_states.float().max().item())
 
         if self.enable_moe_block:
             hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
@@ -608,8 +668,16 @@ class Gemma4DecoderLayer(nn.Module):
             # Router and MoE experts see the residual (pre-MLP state),
             # matching the HF transformers forward path
             router_logits = self.router(residual)
+            if _tracing:
+                _dbg.warning("L%d router_logits: nan=%s min=%.4f max=%.4f",
+                    self.layer_idx, router_logits.isnan().any().item(),
+                    router_logits.float().min().item(), router_logits.float().max().item())
             hidden_states_2 = self.pre_feedforward_layernorm_2(residual)
             hidden_states_2 = self.moe(hidden_states_2, router_logits)
+            if _tracing:
+                _dbg.warning("L%d after moe: nan=%s min=%.4f max=%.4f",
+                    self.layer_idx, hidden_states_2.isnan().any().item(),
+                    hidden_states_2.float().min().item(), hidden_states_2.float().max().item())
             hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
 
             # Combine MLP and MoE outputs
@@ -617,6 +685,10 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = hidden_states + residual
+        if _tracing:
+            _dbg.warning("L%d after residual: nan=%s min=%.4f max=%.4f",
+                self.layer_idx, hidden_states.isnan().any().item(),
+                hidden_states.float().min().item(), hidden_states.float().max().item())
 
         # Apply PLE (Per-Layer Embedding) if configured
         if per_layer_input is not None and self.per_layer_input_gate is not None:
@@ -633,11 +705,6 @@ class Gemma4DecoderLayer(nn.Module):
         # Apply per-layer scalar (all text layers)
         hidden_states = hidden_states * self.layer_scalar
 
-        # DEBUG: Check hidden states per layer
-        import logging as _logging
-        _dbg = _logging.getLogger("gemma4_debug")
-        if not hasattr(self, '_layer_debug_count'):
-            self._layer_debug_count = 0
         if self._layer_debug_count < 2:
             _dbg.warning(
                 "GEMMA4 LAYER %d: hidden min=%.6f max=%.6f mean=%.6f "
