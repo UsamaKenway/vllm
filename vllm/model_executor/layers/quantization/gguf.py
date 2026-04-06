@@ -591,8 +591,8 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(
             w13_qweight,
             {
-                "input_dim": 1,
-                "output_dim": 0,
+                "input_dim": 2,
+                "output_dim": 1,
                 "tensor_shape": tensor_shape,
                 "is_gguf_weight": True,
                 "data_container": [],
@@ -617,8 +617,8 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(
             w2_qweight,
             {
-                "input_dim": 1,
-                "output_dim": 0,
+                "input_dim": 2,
+                "output_dim": 2,
                 "tensor_shape": tensor_shape,
                 "is_gguf_weight": True,
                 "data_container": [],

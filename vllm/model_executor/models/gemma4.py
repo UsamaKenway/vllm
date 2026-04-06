@@ -1043,6 +1043,15 @@ class Gemma4Model(nn.Module):
                     # per-expert arguments.
                     if "moe.experts." in name:
                         if getattr(param, "is_gguf_weight", False):
+                            output_dim = getattr(param, "output_dim", None)
+                            if output_dim is not None:
+                                tp_size = get_tensor_model_parallel_world_size()
+                                tp_rank = get_tensor_model_parallel_rank()
+                                if loaded_weight.size(output_dim) > param.tensor_shape[output_dim]:
+                                    shard_size = param.tensor_shape[output_dim]
+                                    start_idx = tp_rank * shard_size
+                                    loaded_weight = loaded_weight.narrow(
+                                        output_dim, start_idx, shard_size)
                             param.data_container.append(loaded_weight)
                             loaded_params.add(name)
                             continue
