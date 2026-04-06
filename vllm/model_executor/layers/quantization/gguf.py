@@ -555,6 +555,17 @@ class GGUFLinearMethod(LinearMethodBase):
         else:
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type
+            # DEBUG: detect wrong qweight_type causing NaN
+            if not hasattr(self, '_gguf_debug_done'):
+                self._gguf_debug_done = set()
+            layer_id = id(layer)
+            if layer_id not in self._gguf_debug_done:
+                self._gguf_debug_done.add(layer_id)
+                import logging
+                logging.getLogger("gemma4_debug").warning(
+                    "GGUF apply: qweight_type=%s qweight_shape=%s x_shape=%s prefix=%s",
+                    qweight_type, list(qweight.shape), list(x.shape),
+                    getattr(layer, '_prefix', 'unknown'))
             out = fused_mul_mat_gguf(x, qweight, qweight_type)
         if bias is not None:
             out.add_(bias)

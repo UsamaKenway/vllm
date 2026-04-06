@@ -116,6 +116,23 @@ class Gemma4MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+
+        # DEBUG: bypass GGUF kernel for down_proj - use dequantized matmul
+        if hasattr(self.down_proj, 'qweight'):
+            from vllm._custom_ops import ggml_dequantize
+            _qw = self.down_proj.qweight
+            _qt = self.down_proj.qweight_type.weight_type
+            m = _qw.shape[0]  # output dim
+            n = x.shape[-1]   # input dim
+            w_float = ggml_dequantize(_qw, _qt, m, n, x.dtype)
+            x = torch.nn.functional.linear(x, w_float)
+        else:
+            x, _ = self.down_proj(x)
+        return x
+
+    def forward_DISABLED(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
 
         # DEBUG: trace NaN source in MLP
@@ -145,19 +162,24 @@ class Gemma4MLP(nn.Module):
                     act_out.isnan().any().item(),
                     list(self.down_proj.qweight.shape) if hasattr(self.down_proj, 'qweight') else 'N/A',
                 )
+                # Direct test: use exact same weight data with fused_mul_mat_gguf
+                from vllm.model_executor.layers.quantization.gguf import fused_mul_mat_gguf as _fmmg
+                _qw = self.down_proj.qweight
+                _qt = self.down_proj.qweight_type.weight_type
+                _direct = _fmmg(act_out, _qw, _qt)
                 dp, _ = self.down_proj(act_out)
                 _dbg.warning(
-                    "MLP NaN trace: down_out nan=%s min=%.4f max=%.4f "
-                    "down_qtype=%s down_qweight[:4]=%s "
-                    "act_out min=%.4f max=%.4f shape=%s",
+                    "MLP NaN trace: DIRECT fmmg nan=%s, "
+                    "down_proj.forward nan=%s, "
+                    "qtype=%s qw_sum=%s act_sum=%.4f "
+                    "qw_is_contiguous=%s act_is_contiguous=%s",
+                    _direct.isnan().any().item(),
                     dp.isnan().any().item(),
-                    dp.float().min().item() if not dp.isnan().any() else float('nan'),
-                    dp.float().max().item() if not dp.isnan().any() else float('nan'),
-                    getattr(self.down_proj.qweight_type, 'weight_type', 'N/A') if hasattr(self.down_proj, 'qweight_type') else 'N/A',
-                    self.down_proj.qweight.data.flatten()[:4].tolist() if hasattr(self.down_proj, 'qweight') else 'N/A',
-                    act_out.float().min().item() if not act_out.isnan().any() else float('nan'),
-                    act_out.float().max().item() if not act_out.isnan().any() else float('nan'),
-                    list(act_out.shape),
+                    _qt,
+                    _qw.sum().item(),
+                    act_out.float().sum().item() if not act_out.isnan().any() else float('nan'),
+                    _qw.is_contiguous(),
+                    act_out.is_contiguous(),
                 )
         return x
 
