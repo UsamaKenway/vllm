@@ -555,18 +555,18 @@ class GGUFLinearMethod(LinearMethodBase):
         else:
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type
-            # DEBUG: detect wrong qweight_type causing NaN
-            if not hasattr(self, '_gguf_debug_done'):
-                self._gguf_debug_done = set()
-            layer_id = id(layer)
-            if layer_id not in self._gguf_debug_done:
-                self._gguf_debug_done.add(layer_id)
-                import logging
-                logging.getLogger("gemma4_debug").warning(
-                    "GGUF apply: qweight_type=%s qweight_shape=%s x_shape=%s prefix=%s",
-                    qweight_type, list(qweight.shape), list(x.shape),
-                    getattr(layer, '_prefix', 'unknown'))
-            out = fused_mul_mat_gguf(x, qweight, qweight_type)
+            if getattr(layer, '_gguf_use_dequant', False):
+                # Workaround: some models (e.g. Gemma4) hit NaN with
+                # fused_mul_mat_gguf on RowParallelLinear layers.
+                # Dequantize + F.linear avoids the kernel issue while
+                # preserving the RowParallelLinear TP path.
+                from vllm._custom_ops import ggml_dequantize
+                m = qweight.shape[0]
+                n = layer.input_size_per_partition
+                w = ggml_dequantize(qweight, qweight_type, m, n, x.dtype)
+                out = torch.nn.functional.linear(x, w)
+            else:
+                out = fused_mul_mat_gguf(x, qweight, qweight_type)
         if bias is not None:
             out.add_(bias)
         return out

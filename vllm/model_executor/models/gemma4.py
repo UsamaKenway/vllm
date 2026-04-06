@@ -105,6 +105,9 @@ class Gemma4MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
+        # Workaround: fused_mul_mat_gguf produces NaN on
+        # RowParallelLinear in Gemma4 MLP. Use dequantize path.
+        self.down_proj._gguf_use_dequant = True
         if hidden_activation != "gelu_pytorch_tanh":
             raise ValueError(
                 "Gemma4 uses `gelu_pytorch_tanh` as the hidden activation "
@@ -116,76 +119,8 @@ class Gemma4MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-
-        # DEBUG: bypass GGUF kernel for down_proj - use dequantized matmul
-        if hasattr(self.down_proj, 'qweight'):
-            from vllm._custom_ops import ggml_dequantize
-            _qw = self.down_proj.qweight
-            _qt = self.down_proj.qweight_type.weight_type
-            m = _qw.shape[0]  # output dim
-            n = x.shape[-1]   # input dim
-            w_float = ggml_dequantize(_qw, _qt, m, n, x.dtype)
-            x = torch.nn.functional.linear(x, w_float)
-        else:
-            x, _ = self.down_proj(x)
-        return x
-
-    def forward_DISABLED(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
-
-        # DEBUG: trace NaN source in MLP
-        if x.isnan().any():
-            import logging as _logging
-            _dbg = _logging.getLogger("gemma4_debug")
-            # Re-run step by step to find the NaN source
-            with torch.no_grad():
-                inp = self.input_debug  # captured below
-                gu, _ = self.gate_up_proj(inp)
-                _dbg.warning(
-                    "MLP NaN trace: input nan=%s min=%.4f max=%.4f, "
-                    "gate_up nan=%s min=%.4f max=%.4f shape=%s, "
-                    "gate_up_proj qweight shape=%s shard_id=%s",
-                    inp.isnan().any().item(),
-                    inp.float().min().item(), inp.float().max().item(),
-                    gu.isnan().any().item(),
-                    gu.float().min().item() if not gu.isnan().any() else float('nan'),
-                    gu.float().max().item() if not gu.isnan().any() else float('nan'),
-                    list(gu.shape),
-                    list(self.gate_up_proj.qweight.shape) if hasattr(self.gate_up_proj, 'qweight') else 'N/A',
-                    getattr(self.gate_up_proj.qweight, 'shard_id', 'N/A') if hasattr(self.gate_up_proj, 'qweight') else 'N/A',
-                )
-                act_out = self.act_fn(gu)
-                _dbg.warning(
-                    "MLP NaN trace: act nan=%s, down_proj qweight shape=%s",
-                    act_out.isnan().any().item(),
-                    list(self.down_proj.qweight.shape) if hasattr(self.down_proj, 'qweight') else 'N/A',
-                )
-                # Direct test: use exact same weight data with fused_mul_mat_gguf
-                from vllm.model_executor.layers.quantization.gguf import fused_mul_mat_gguf as _fmmg
-                _qw = self.down_proj.qweight
-                _qt = self.down_proj.qweight_type.weight_type
-                _direct = _fmmg(act_out, _qw, _qt)
-                dp, _ = self.down_proj(act_out)
-                _dbg.warning(
-                    "MLP NaN trace: DIRECT fmmg nan=%s, "
-                    "down_proj.forward nan=%s, "
-                    "qtype=%s qw_sum=%s act_sum=%.4f "
-                    "qw_is_contiguous=%s act_is_contiguous=%s",
-                    _direct.isnan().any().item(),
-                    dp.isnan().any().item(),
-                    _qt,
-                    _qw.sum().item(),
-                    act_out.float().sum().item() if not act_out.isnan().any() else float('nan'),
-                    _qw.is_contiguous(),
-                    act_out.is_contiguous(),
-                )
         return x
-
-    def __call__(self, x, *args, **kwargs):
-        self.input_debug = x.detach()
-        return super().__call__(x, *args, **kwargs)
 
 
 class Gemma4Router(nn.Module):
@@ -652,12 +587,6 @@ class Gemma4DecoderLayer(nn.Module):
         # Gemma4 residual pattern:
         # 1. input_norm(x) → attn → post_attn_norm → ADD residual
         # 2. pre_ff_norm → mlp → post_ff_norm → ADD residual
-        import logging as _logging
-        _dbg = _logging.getLogger("gemma4_debug")
-        if not hasattr(self, '_layer_debug_count'):
-            self._layer_debug_count = 0
-        _tracing = self._layer_debug_count < 2 and self.layer_idx in (7, 8)
-
         residual = hidden_states
 
         hidden_states = self.input_layernorm(residual)
@@ -667,10 +596,6 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             **kwargs,
         )
-        if _tracing:
-            _dbg.warning("L%d after attn: nan=%s min=%.4f max=%.4f",
-                self.layer_idx, hidden_states.isnan().any().item(),
-                hidden_states.float().min().item(), hidden_states.float().max().item())
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = hidden_states + residual
@@ -679,10 +604,6 @@ class Gemma4DecoderLayer(nn.Module):
         # MLP runs unconditionally (same inputs for MoE and non-MoE)
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        if _tracing:
-            _dbg.warning("L%d after mlp: nan=%s min=%.4f max=%.4f",
-                self.layer_idx, hidden_states.isnan().any().item(),
-                hidden_states.float().min().item(), hidden_states.float().max().item())
 
         if self.enable_moe_block:
             hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
@@ -690,16 +611,8 @@ class Gemma4DecoderLayer(nn.Module):
             # Router and MoE experts see the residual (pre-MLP state),
             # matching the HF transformers forward path
             router_logits = self.router(residual)
-            if _tracing:
-                _dbg.warning("L%d router_logits: nan=%s min=%.4f max=%.4f",
-                    self.layer_idx, router_logits.isnan().any().item(),
-                    router_logits.float().min().item(), router_logits.float().max().item())
             hidden_states_2 = self.pre_feedforward_layernorm_2(residual)
             hidden_states_2 = self.moe(hidden_states_2, router_logits)
-            if _tracing:
-                _dbg.warning("L%d after moe: nan=%s min=%.4f max=%.4f",
-                    self.layer_idx, hidden_states_2.isnan().any().item(),
-                    hidden_states_2.float().min().item(), hidden_states_2.float().max().item())
             hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
 
             # Combine MLP and MoE outputs
@@ -707,10 +620,6 @@ class Gemma4DecoderLayer(nn.Module):
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = hidden_states + residual
-        if _tracing:
-            _dbg.warning("L%d after residual: nan=%s min=%.4f max=%.4f",
-                self.layer_idx, hidden_states.isnan().any().item(),
-                hidden_states.float().min().item(), hidden_states.float().max().item())
 
         # Apply PLE (Per-Layer Embedding) if configured
         if per_layer_input is not None and self.per_layer_input_gate is not None:
@@ -723,22 +632,8 @@ class Gemma4DecoderLayer(nn.Module):
             )
             hidden_states = hidden_states + per_layer_contribution
 
-        # Apply layer scalar for full-attention layers
         # Apply per-layer scalar (all text layers)
         hidden_states = hidden_states * self.layer_scalar
-
-        if self._layer_debug_count < 2:
-            _dbg.warning(
-                "GEMMA4 LAYER %d: hidden min=%.6f max=%.6f mean=%.6f "
-                "nan=%s scalar=%.6f",
-                self.layer_idx,
-                hidden_states.float().min().item(),
-                hidden_states.float().max().item(),
-                hidden_states.float().mean().item(),
-                hidden_states.isnan().any().item(),
-                self.layer_scalar.item(),
-            )
-            self._layer_debug_count += 1
 
         return hidden_states, None
 
@@ -1021,28 +916,6 @@ class Gemma4Model(nn.Module):
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
-
-        # DEBUG: Check for NaN/Inf/Zero in final hidden states
-        import logging as _logging
-        _dbg = _logging.getLogger("gemma4_debug")
-        if not hasattr(self, '_debug_count'):
-            self._debug_count = 0
-        if self._debug_count < 3:
-            _dbg.warning(
-                "GEMMA4 DEBUG final hidden_states: "
-                "shape=%s, dtype=%s, "
-                "min=%.6f, max=%.6f, mean=%.6f, "
-                "nan=%s, inf=%s, allzero=%s",
-                hidden_states.shape, hidden_states.dtype,
-                hidden_states.float().min().item(),
-                hidden_states.float().max().item(),
-                hidden_states.float().mean().item(),
-                hidden_states.isnan().any().item(),
-                hidden_states.isinf().any().item(),
-                (hidden_states == 0).all().item(),
-            )
-            self._debug_count += 1
-
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
