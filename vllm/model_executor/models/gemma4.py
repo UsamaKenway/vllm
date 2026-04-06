@@ -633,6 +633,24 @@ class Gemma4DecoderLayer(nn.Module):
         # Apply per-layer scalar (all text layers)
         hidden_states = hidden_states * self.layer_scalar
 
+        # DEBUG: Check hidden states per layer
+        import logging as _logging
+        _dbg = _logging.getLogger("gemma4_debug")
+        if not hasattr(self, '_layer_debug_count'):
+            self._layer_debug_count = 0
+        if self._layer_debug_count < 2:
+            _dbg.warning(
+                "GEMMA4 LAYER %d: hidden min=%.6f max=%.6f mean=%.6f "
+                "nan=%s scalar=%.6f",
+                self.layer_idx,
+                hidden_states.float().min().item(),
+                hidden_states.float().max().item(),
+                hidden_states.float().mean().item(),
+                hidden_states.isnan().any().item(),
+                self.layer_scalar.item(),
+            )
+            self._layer_debug_count += 1
+
         return hidden_states, None
 
 
@@ -914,6 +932,28 @@ class Gemma4Model(nn.Module):
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
+
+        # DEBUG: Check for NaN/Inf/Zero in final hidden states
+        import logging as _logging
+        _dbg = _logging.getLogger("gemma4_debug")
+        if not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+        if self._debug_count < 3:
+            _dbg.warning(
+                "GEMMA4 DEBUG final hidden_states: "
+                "shape=%s, dtype=%s, "
+                "min=%.6f, max=%.6f, mean=%.6f, "
+                "nan=%s, inf=%s, allzero=%s",
+                hidden_states.shape, hidden_states.dtype,
+                hidden_states.float().min().item(),
+                hidden_states.float().max().item(),
+                hidden_states.float().mean().item(),
+                hidden_states.isnan().any().item(),
+                hidden_states.isinf().any().item(),
+                (hidden_states == 0).all().item(),
+            )
+            self._debug_count += 1
+
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
