@@ -465,6 +465,7 @@ def _topk(
         and logits.stride(0) % 4 == 0
         and current_platform.has_device_capability(90)
         and not current_platform.is_device_capability_family(120)
+        and not current_platform.is_device_capability_family(110)
     )
     topk_op = (
         torch.ops._C.cooperative_topk
